@@ -8,6 +8,8 @@ The server is deliberately **independent of the ScopeDB source tree**: it
 ships its own vendored ScopeQL lexer, so it can be built, hosted and evolved
 in this repository on its own.
 
+![example](./assets/example.gif)
+
 ## Features
 
 - **Semantic tokens** (`textDocument/semanticTokens/full`) — the editor
