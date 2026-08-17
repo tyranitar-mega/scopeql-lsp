@@ -1,0 +1,27 @@
+[package]
+name = "scopeql-lsp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A self-contained language server for ScopeQL, with a companion vim plugin for semantic highlighting"
+license = "MIT"
+rust-version = "1.88"
+
+[lib]
+name = "scopeql_lsp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "scopeql-lsp"
+path = "src/main.rs"
+
+[dependencies]
+lsp-server = "0.10.0"
+lsp-types = "0.97.0"
+logos = "0.16.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = true
+strip = true
