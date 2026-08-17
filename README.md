@@ -1,6 +1,6 @@
 # scopeql-lsp
 
-A self-contained language server for [ScopeQL](https://docs.scopedb.io),
+A self-contained language server for [ScopeQL](https://github.com/scopedb/scopeql),
 the query language of ScopeDB, together with a **vim plugin** that gives
 `.scopeql` files semantic (LSP-based) syntax highlighting in coc.nvim.
 
@@ -218,5 +218,5 @@ scopeql-lsp/
 
 ## License
 
-Apache-2.0, with attribution to [ScopeDB](https://github.com/scopedb/scopedb)
-for the derived ScopeQL token vocabulary. See [LICENSE](LICENSE).
+Apache-2.0, with attribution to ScopeDB for the derived ScopeQL token
+vocabulary. See [LICENSE](LICENSE).

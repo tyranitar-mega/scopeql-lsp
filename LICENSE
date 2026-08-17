@@ -203,8 +203,7 @@ Apache License
 ---
 
 The ScopeQL token vocabulary (keywords, type names and token patterns) in
-`src/lexer.rs` is derived from the [ScopeDB](https://github.com/scopedb/scopedb)
-project. ScopeDB is:
+`src/lexer.rs` is derived from the ScopeDB project. ScopeDB is:
 
 Copyright (c) 2024 ScopeDB Inc.
 All rights reserved.
