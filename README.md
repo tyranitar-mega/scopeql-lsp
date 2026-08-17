@@ -8,7 +8,15 @@ The server is deliberately **independent of the ScopeDB source tree**: it
 ships its own vendored ScopeQL lexer, so it can be built, hosted and evolved
 in this repository on its own.
 
-![example](./assets/example.gif)
+## Demo
+
+Jump to the definition or find references of a table or column:
+
+![](./assets/jump-definition-reference.gif)
+
+Rename a table or column:
+
+![](./assets/rename.gif)
 
 ## Features
 
