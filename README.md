@@ -1,6 +1,6 @@
 # scopeql-lsp
 
-A self-contained language server for [ScopeQL](https://github.com/scopedb/scopedb),
+A self-contained language server for [ScopeQL](https://docs.scopedb.io),
 the query language of ScopeDB, together with a **vim plugin** that gives
 `.scopeql` files semantic (LSP-based) syntax highlighting in coc.nvim.
 
@@ -26,6 +26,35 @@ function calls, names after `CREATE TABLE`/`FROM`/`JOIN`/`INTO`/... read as
 object names, members after `.` and *"column positions"* (after `SELECT`,
 `WHERE`, `,`, `(`, `=`) read as columns. This gives genuinely useful colors
 without name resolution, and it cannot drift from the lexer.
+
+## Installation (private repository)
+
+This repository is **private**, so it cannot be cloned anonymously — GitHub
+will prompt for credentials. Pick one of the two authenticated transports:
+
+```bash
+# SSH — requires a GitHub SSH key on your machine (recommended)
+git clone git@github.com:tyranitar-mega/scopeql-lsp.git
+
+# HTTPS — prompts for your GitHub username and a personal access token (PAT)
+git clone https://github.com/tyranitar-mega/scopeql-lsp.git
+```
+
+> For HTTPS, use a PAT with at least `Contents: Read` scope as the password —
+> GitHub no longer accepts account passwords for git. If you prefer not to
+> issue tokens, the repository owner can add you as a collaborator
+> (**Settings → Collaborators** on the GitHub repo page) and you can then
+> clone over SSH with your key.
+
+Once cloned, build the server binary as described in
+[Building](#building) below, then register the plugin in vim as shown in
+[vim + coc.nvim](#vim--cocnvim-recommended).
+
+To pull later updates from the repository:
+
+```bash
+git pull
+```
 
 ## Building
 
@@ -56,16 +85,23 @@ Any LSP client can connect to `scopeql-lsp` over stdio. It advertises:
 
 ### vim + coc.nvim (recommended)
 
-1. Install the plugin. With [vim-plug](https://github.com/junegunn/vim-plug):
+1. Clone the repository locally (see
+   [Installation](#installation-private-repository); the repo is private, so
+   an SSH key or PAT is required), then install the plugin with
+   [vim-plug](https://github.com/junegunn/vim-plug), pointing at your clone:
 
    ```vim
-   Plug '/path/to/scopeql-lsp'
+   Plug '~/code/scopeql-lsp'   " use the path of your local clone
    ```
 
-   or add the repository to your `runtimepath` manually.
+   or add that path to your `runtimepath` manually.
 
 2. Make sure `scopeql-lsp` is in `$PATH`, or point the config at the built
-   binary (see `g:scopeql_lsp_command`).
+   binary (see `g:scopeql_lsp_command`). For example:
+
+   ```bash
+   export PATH="$HOME/code/scopeql-lsp/target/release:$PATH"
+   ```
 
 3. Register the server and enable semantic tokens in **coc-settings.json**
    (project-local `.vim/coc-settings.json` or `:CocConfig`):
@@ -123,5 +159,5 @@ scopeql-lsp/
 
 ## License
 
-MIT, with attribution to [ScopeDB](https://github.com/scopedb/scopedb) for
-the derived ScopeQL token vocabulary. See [LICENSE](LICENSE).
+Apache-2.0, with attribution to [ScopeDB](https://github.com/scopedb/scopedb)
+for the derived ScopeQL token vocabulary. See [LICENSE](LICENSE).
