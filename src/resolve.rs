@@ -1,16 +1,26 @@
-//! Object-name extraction and matching for workspace-wide navigation.
+//! Name extraction and matching for workspace-wide navigation.
 //!
 //! This module identifies the names the language server can navigate to
-//! (`textDocument/definition` and `textDocument/references`): object
-//! *definitions* such as `CREATE TABLE t (...)`, and object *references* in
-//! clauses such as `SELECT ... FROM t`, `JOIN t`, `INSERT INTO t`,
-//! `UPDATE t`, `DELETE FROM t`, `DROP TABLE t`, `ALTER TABLE t`,
-//! `DESCRIBE t`, `OPTIMIZE t` and `VACUUM t`.
+//! (`textDocument/definition` and `textDocument/references`):
+//!
+//! * **Objects** — definitions such as `CREATE TABLE t (...)`, and
+//!   references in clauses such as `SELECT ... FROM t`, `JOIN t`,
+//!   `INSERT INTO t`, `UPDATE t`, `DELETE FROM t`, `DROP TABLE t`,
+//!   `ALTER TABLE t`, `DESCRIBE t`, `OPTIMIZE t`, `VACUUM t` and
+//!   `CREATE ... INDEX ON t`.
+//! * **Columns** — definitions in `CREATE TABLE t (col type, ...)` and
+//!   `ALTER TABLE t ADD COLUMN col type`, and references resolved per
+//!   statement against the visible tables of that statement (`FROM`/`JOIN`
+//!   targets with their aliases). Column references are kept only when the
+//!   referenced table actually declares the column, and ambiguous
+//!   unqualified names keep every candidate table.
 //!
 //! Like the rest of the crate this is purely lexical: names are recognised
-//! from the surrounding keywords, not from a full parser, so the navigation
+//! from the surrounding tokens, not from a full parser, so the navigation
 //! index can never drift from the lexer. Names must be written as unquoted
 //! identifiers (backticked identifiers are not picked up yet).
+
+use std::collections::{HashMap, HashSet};
 
 use crate::lexer::{Span, Token, TokenKind, lex};
 
@@ -288,6 +298,461 @@ fn is_dot(tok: &Token, source: &str) -> bool {
     text == "."
 }
 
+// ---------------------------------------------------------------------------
+// Column navigation
+// ---------------------------------------------------------------------------
+
+/// A column definition: `column` of table `table` (lower-cased dotted path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnDef {
+    pub table: String,
+    pub column: String,
+    /// Byte range of the *column name* in the source.
+    pub span: Span,
+}
+
+impl ColumnDef {
+    /// The last dot-component of a table path (`sales.logs` -> `logs`).
+    pub fn table_key(path: &str) -> String {
+        path.rsplit('.').next().unwrap_or(path).to_string()
+    }
+}
+
+/// A resolved column reference: `column` of table `table` at a reference site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnRef {
+    pub table: String,
+    pub column: String,
+    /// Byte range of the *column name* in the source.
+    pub span: Span,
+}
+
+/// A table that is in scope for one statement: the path as written plus the
+/// alias it was given (`FROM sales.orders o` -> path `sales.orders`,
+/// alias `o`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleTable {
+    pub path: String,
+    pub alias: Option<String>,
+}
+
+/// Keywords after which a bare identifier reads as a column reference in a
+/// query (`SELECT col`, `WHERE col`, `GROUP BY col`, `SET col = ...`, ...).
+/// Mirrors the "column position" heuristic used by [`crate::highlight`].
+const COLUMN_POSITION_KEYWORDS: &[&str] = &[
+    "select", "where", "on", "by", "group", "order", "having", "limit",
+    "offset", "set", "window", "aggregate", "distinct", "values", "between",
+    "when", "then", "case",
+];
+
+/// Extract column definitions from `source`:
+/// `CREATE TABLE t (col type, ...)` column lists and
+/// `ALTER TABLE t ADD COLUMN col type`.
+pub fn column_definitions(source: &str) -> Vec<ColumnDef> {
+    let (tokens, _) = lex(source);
+    let mut out = Vec::new();
+
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i].kind != TokenKind::Keyword {
+            i += 1;
+            continue;
+        }
+        match word_at(&tokens[i], source).as_str() {
+            "create" => {
+                let mut j = i + 1;
+                while j < tokens.len()
+                    && tokens[j].kind == TokenKind::Keyword
+                    && {
+                        let w = word_at(&tokens[j], source);
+                        matches!(w.as_str(), "or" | "replace")
+                            || KIND_QUALIFIERS.contains(&w.as_str())
+                    }
+                {
+                    j += 1;
+                }
+                let kind_is_table = j < tokens.len()
+                    && tokens[j].kind == TokenKind::Keyword
+                    && word_at(&tokens[j], source) == "table";
+                if !kind_is_table {
+                    i += 1;
+                    continue;
+                }
+                let mut k = j + 1;
+                while k < tokens.len()
+                    && tokens[k].kind == TokenKind::Keyword
+                    && matches!(word_at(&tokens[k], source).as_str(), "if" | "not" | "exists")
+                {
+                    k += 1;
+                }
+                let Some((table, _, _)) = read_name_path(&tokens, k, source) else {
+                    i += 1;
+                    continue;
+                };
+                // The column list is the parenthesised block after the name.
+                if let Some(open) = find_lparen(&tokens, k, source) {
+                    for cd in parse_column_list(&tokens, open, source, &table) {
+                        out.push(cd);
+                    }
+                }
+                i = k + 1;
+            }
+            "alter" => {
+                // `ALTER TABLE <path> ADD COLUMN <col> <type>`.
+                let mut j = i + 1;
+                while j < tokens.len()
+                    && tokens[j].kind == TokenKind::Keyword
+                    && (kind_of(&word_at(&tokens[j], source)).is_some()
+                        || matches!(word_at(&tokens[j], source).as_str(), "if" | "not" | "exists"))
+                {
+                    j += 1;
+                }
+                let Some((table, _, after)) = read_name_path(&tokens, j, source) else {
+                    i += 1;
+                    continue;
+                };
+                let mut k = after;
+                while k + 2 < tokens.len() {
+                    if tokens[k].kind == TokenKind::Keyword
+                        && word_at(&tokens[k], source) == "add"
+                        && tokens[k + 1].kind == TokenKind::Keyword
+                        && word_at(&tokens[k + 1], source) == "column"
+                        && tokens[k + 2].kind == TokenKind::Ident
+                    {
+                        out.push(ColumnDef {
+                            table: table.clone(),
+                            column: word_at(&tokens[k + 2], source),
+                            span: tokens[k + 2].span,
+                        });
+                        break;
+                    }
+                    k += 1;
+                }
+                i = after;
+            }
+            _ => i += 1,
+        }
+        i += 1;
+    }
+
+    out
+}
+
+/// Find the first `(` at or after `start` (usually right after a table name).
+fn find_lparen(tokens: &[Token], start: usize, source: &str) -> Option<usize> {
+    tokens[start..]
+        .iter()
+        .position(|t| t.kind == TokenKind::Operator && punct_char(t, source) == Some('('))
+        .map(|off| start + off)
+}
+
+/// Parse the parenthesised column list of `CREATE TABLE`:
+/// every `<col> <type>` pair. Non-pair tokens (constraints, nested parens)
+/// are ignored.
+fn parse_column_list(
+    tokens: &[Token],
+    open: usize,
+    source: &str,
+    table: &str,
+) -> Vec<ColumnDef> {
+    let mut out = Vec::new();
+    let mut depth = 1usize;
+    let mut i = open + 1;
+    while i < tokens.len() && depth > 0 {
+        let t = &tokens[i];
+        if t.kind == TokenKind::Operator {
+            match punct_char(t, source) {
+                Some('(') => {
+                    depth += 1;
+                    i += 1;
+                    continue;
+                }
+                Some(')') => {
+                    depth -= 1;
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if t.kind == TokenKind::Ident
+            && tokens
+                .get(i + 1)
+                .is_some_and(|n| matches!(n.kind, TokenKind::Ident | TokenKind::Type))
+        {
+            out.push(ColumnDef {
+                table: table.to_string(),
+                column: word_at(t, source),
+                span: t.span,
+            });
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The token ranges of the statements in `tokens`, split on `;`.
+/// A trailing unterminated statement is included.
+pub fn statements(tokens: &[Token], source: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for (idx, t) in tokens.iter().enumerate() {
+        if t.kind == TokenKind::Operator && punct_char(t, source) == Some(';') {
+            ranges.push((start, idx));
+            start = idx + 1;
+        }
+    }
+    if start < tokens.len() {
+        ranges.push((start, tokens.len()));
+    }
+    ranges
+}
+
+/// The token range of the statement containing byte `byte`.
+pub fn statement_range(tokens: &[Token], byte: usize, source: &str) -> (usize, usize) {
+    let mut from = 0;
+    let mut to = tokens.len();
+    for (idx, t) in tokens.iter().enumerate() {
+        if t.kind == TokenKind::Operator && punct_char(t, source) == Some(';') {
+            if (t.span.start as usize) < byte {
+                from = idx + 1;
+            } else if to == tokens.len() {
+                to = idx;
+            }
+        }
+    }
+    (from, to)
+}
+
+/// The tables visible in a statement: the targets of `FROM`, `JOIN`,
+/// `INSERT INTO`, `UPDATE`, `DELETE [FROM]`, and the `ON` target of
+/// `CREATE ... INDEX ON t`, together with their aliases (`FROM t AS x` or
+/// a bare alias `FROM t x`).
+pub fn visible_tables(tokens: &[Token], from: usize, to: usize, source: &str) -> Vec<VisibleTable> {
+    let mut out = Vec::new();
+    let mut i = from;
+    while i < to {
+        if tokens[i].kind != TokenKind::Keyword {
+            i += 1;
+            continue;
+        }
+        let word = word_at(&tokens[i], source);
+        let (pick, start) = match word.as_str() {
+            "delete" => {
+                let mut s = i + 1;
+                if s < to
+                    && tokens[s].kind == TokenKind::Keyword
+                    && word_at(&tokens[s], source) == "from"
+                {
+                    s += 1;
+                }
+                (true, s)
+            }
+            "from" | "join" | "into" | "update" => (true, i + 1),
+            // `CREATE ... INDEX ON t` makes `t` visible (index statements
+            // index its columns).
+            "create" => {
+                let mut j = i + 1;
+                while j < to
+                    && tokens[j].kind == TokenKind::Keyword
+                    && {
+                        let w = word_at(&tokens[j], source);
+                        matches!(w.as_str(), "or" | "replace")
+                            || KIND_QUALIFIERS.contains(&w.as_str())
+                    }
+                {
+                    j += 1;
+                }
+                if j + 1 < to
+                    && tokens[j].kind == TokenKind::Keyword
+                    && word_at(&tokens[j], source) == "index"
+                    && tokens[j + 1].kind == TokenKind::Keyword
+                    && word_at(&tokens[j + 1], source) == "on"
+                {
+                    (true, j + 2)
+                } else {
+                    (false, 0)
+                }
+            }
+            _ => (false, 0),
+        };
+        if !pick {
+            i += 1;
+            continue;
+        }
+        let Some((path, _, after)) = read_name_path(tokens, start, source) else {
+            i += 1;
+            continue;
+        };
+        let mut alias = None;
+        let mut a = after;
+        if a < to && tokens[a].kind == TokenKind::Keyword && word_at(&tokens[a], source) == "as" {
+            a += 1;
+        }
+        if a < to
+            && tokens[a].kind == TokenKind::Ident
+            && !(a + 1 < to
+                && tokens[a + 1].kind == TokenKind::Operator
+                && punct_char(&tokens[a + 1], source) == Some('('))
+        {
+            alias = Some(word_at(&tokens[a], source));
+        }
+        out.push(VisibleTable { path, alias });
+        i = after;
+    }
+    out
+}
+
+/// Whether `tokens[idx]` (an identifier) sits in a column-reference position:
+/// right after a query-clause keyword, or after `(`, `,`, `=`, `[` or `:`.
+pub fn is_column_position(tokens: &[Token], idx: usize, source: &str) -> bool {
+    let Some(prev) = idx.checked_sub(1).map(|p| &tokens[p]) else {
+        return false;
+    };
+    match prev.kind {
+        TokenKind::Keyword => {
+            let w = word_at(prev, source);
+            COLUMN_POSITION_KEYWORDS.contains(&w.as_str())
+        }
+        TokenKind::Operator => matches!(
+            punct_char(prev, source),
+            Some('(') | Some(',') | Some('=') | Some('[') | Some(':')
+        ),
+        _ => false,
+    }
+}
+
+/// The dot-joined identifier chain containing `tokens[idx]` and the position
+/// of `idx` inside it (`sales.order_events` with the cursor on `order` ->
+/// parts `["sales", "order", "events"]`, index 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentChain {
+    pub parts: Vec<String>,
+    pub idx_in_chain: usize,
+}
+
+pub fn ident_chain(tokens: &[Token], idx: usize, source: &str) -> IdentChain {
+    let mut start = idx;
+    while start >= 2
+        && is_dot(&tokens[start - 1], source)
+        && tokens[start - 2].kind == TokenKind::Ident
+    {
+        start -= 2;
+    }
+    let mut end = idx + 1;
+    while end + 1 < tokens.len()
+        && is_dot(&tokens[end], source)
+        && tokens[end + 1].kind == TokenKind::Ident
+    {
+        end += 2;
+    }
+    let mut parts = Vec::new();
+    let mut idx_in_chain = 0;
+    for (k, t) in tokens[start..end].iter().enumerate() {
+        if t.kind == TokenKind::Ident {
+            if start + k == idx {
+                idx_in_chain = parts.len();
+            }
+            parts.push(word_at(t, source));
+        }
+    }
+    IdentChain {
+        parts,
+        idx_in_chain,
+    }
+}
+
+/// Extract column references from `source`. `known` maps a table's last
+/// path component to the set of columns it declares (from
+/// [`column_definitions`] across the workspace); a reference is kept only
+/// when the table it resolves to actually declares the column.
+pub fn column_references(
+    source: &str,
+    known: &HashMap<String, HashSet<String>>,
+) -> Vec<ColumnRef> {
+    let (tokens, _) = lex(source);
+    let mut out = Vec::new();
+
+    for (from, to) in statements(&tokens, source) {
+        let visible = visible_tables(&tokens, from, to, source);
+        if visible.is_empty() {
+            continue;
+        }
+        let mut i = from;
+        while i < to {
+            if tokens[i].kind != TokenKind::Ident {
+                i += 1;
+                continue;
+            }
+            // Function calls are not columns.
+            if i + 1 < to
+                && tokens[i + 1].kind == TokenKind::Operator
+                && punct_char(&tokens[i + 1], source) == Some('(')
+            {
+                i += 1;
+                continue;
+            }
+            // Qualified member access: `alias.col` or `table.col`.
+            if i >= 2
+                && is_dot(&tokens[i - 1], source)
+                && tokens[i - 2].kind == TokenKind::Ident
+            {
+                let qualifier = word_at(&tokens[i - 2], source);
+                let column = word_at(&tokens[i], source);
+                for v in &visible {
+                    let qualifier_matches = v.alias.as_deref() == Some(qualifier.as_str())
+                        || names_match(&v.path, &qualifier);
+                    if qualifier_matches && known_has(known, &v.path, &column) {
+                        out.push(ColumnRef {
+                            table: v.path.clone(),
+                            column: column.clone(),
+                            span: tokens[i].span,
+                        });
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            // Bare identifier in a column position: candidate for every
+            // visible table (ambiguous joins keep all candidates).
+            if is_column_position(&tokens, i, source) {
+                let column = word_at(&tokens[i], source);
+                for v in &visible {
+                    if known_has(known, &v.path, &column) {
+                        out.push(ColumnRef {
+                            table: v.path.clone(),
+                            column: column.clone(),
+                            span: tokens[i].span,
+                        });
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    out
+}
+
+fn known_has(known: &HashMap<String, HashSet<String>>, table_path: &str, column: &str) -> bool {
+    known
+        .get(&ColumnDef::table_key(table_path))
+        .is_some_and(|cols| cols.contains(column))
+}
+
+fn punct_char(tok: &Token, source: &str) -> Option<char> {
+    if tok.kind != TokenKind::Operator {
+        return None;
+    }
+    let text = &source[tok.span.start as usize..tok.span.end as usize];
+    let mut chars = text.chars();
+    let first = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +916,150 @@ mod tests {
     fn names_match_ignores_qualification() {
         assert!(names_match("sales.orders", "orders"));
         assert!(names_match("analytics.daily.events", "events"));
+    }
+
+    // --- column navigation ----------------------------------------------
+
+    #[test]
+    fn column_definitions_extract_create_table_columns() {
+        let src = "CREATE TABLE logs (\n\
+                   \x20 id int,\n\
+                   \x20 time timestamp,\n\
+                   \x20 message string,\n\
+                   \x20 var object\n\
+                   );";
+        let defs = column_definitions(src);
+        let cols: Vec<(&str, &str)> = defs
+            .iter()
+            .map(|d| (d.table.as_str(), d.column.as_str()))
+            .collect();
+        assert_eq!(
+            cols,
+            vec![
+                ("logs", "id"),
+                ("logs", "time"),
+                ("logs", "message"),
+                ("logs", "var"),
+            ]
+        );
+    }
+
+    #[test]
+    fn column_definitions_handle_alter_add_column() {
+        let defs = column_definitions("ALTER TABLE logs ADD COLUMN note string;");
+        assert_eq!(defs.len(), 1);
+        assert_eq!((defs[0].table.as_str(), defs[0].column.as_str()), ("logs", "note"));
+    }
+
+    #[test]
+    fn visible_tables_cover_from_join_into_and_aliases() {
+        let src = "SELECT * FROM sales.events e JOIN customers c ON e.id = c.id \
+                   INSERT INTO archive \
+                   UPDATE staging SET x = 1 \
+                   DELETE FROM trash \
+                   CREATE POINT INDEX ON logs (time);";
+        let (tokens, _) = lex(src);
+        let visible = visible_tables(&tokens, 0, tokens.len(), src);
+        let rows: Vec<(String, Option<String>)> = visible
+            .iter()
+            .map(|v| (v.path.clone(), v.alias.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("sales.events".to_string(), Some("e".to_string())),
+                ("customers".to_string(), Some("c".to_string())),
+                ("archive".to_string(), None),
+                ("staging".to_string(), None),
+                ("trash".to_string(), None),
+                ("logs".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn statements_are_split_on_semicolons() {
+        let src = "SELECT 1; CREATE TABLE t (a int); SELECT 2";
+        let (tokens, _) = lex(src);
+        let ranges = statements(&tokens, src);
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0], (0, 2));
+        assert_eq!(ranges[2], (11, tokens.len()));
+        // statement_range finds the statement owning a byte offset.
+        let byte = tokens[8].span.start as usize; // `t` in CREATE TABLE t
+        let (from, to) = statement_range(&tokens, byte, src);
+        assert_eq!((from, to), ranges[1]);
+    }
+
+    #[test]
+    fn column_references_resolve_qualified_and_alias_members() {
+        let known: HashMap<String, HashSet<String>> = [(
+            "customers".to_string(),
+            ["id", "name"].into_iter().map(str::to_string).collect(),
+        )]
+        .into_iter()
+        .collect();
+        let src = "SELECT * FROM customers c WHERE c.id > 0 AND c.name <> '';";
+        let refs = column_references(src, &known);
+        let rows: Vec<(&str, &str)> = refs
+            .iter()
+            .map(|r| (r.table.as_str(), r.column.as_str()))
+            .collect();
+        assert_eq!(rows, vec![("customers", "id"), ("customers", "name")]);
+    }
+
+    #[test]
+    fn column_references_keep_anonymous_join_candidates_and_filter_unknown() {
+        let known: HashMap<String, HashSet<String>> = [
+            ("a".to_string(), ["id"].into_iter().map(str::to_string).collect()),
+            ("b".to_string(), ["id"].into_iter().map(str::to_string).collect()),
+        ]
+        .into_iter()
+        .collect();
+        let src = "SELECT id, bogus FROM a JOIN b ON a.id = b.id;";
+        let refs = column_references(src, &known);
+        let rows: Vec<(&str, &str)> = refs
+            .iter()
+            .map(|r| (r.table.as_str(), r.column.as_str()))
+            .collect();
+        // `bogus` is filtered out (no table declares it); unambiguous `id`
+        // keeps both candidate tables; `ON a.id = b.id` resolves via aliases.
+        assert_eq!(
+            rows,
+            vec![
+                ("a", "id"),
+                ("b", "id"),
+                ("a", "id"),
+                ("b", "id"),
+            ]
+        );
+    }
+
+    #[test]
+    fn is_column_position_distinguishes_positions() {
+        let src = "SELECT service, count(*) FROM t WHERE time > now();";
+        let (tokens, _) = lex(src);
+        let idx = |w: &str| tokens.iter().position(|t| t.text(src) == w).unwrap();
+        assert!(is_column_position(&tokens, idx("service"), src));
+        assert!(is_column_position(&tokens, idx("time"), src));
+        // `count` sits after `,` (a column-shaped position) but is excluded
+        // from references by the function-call check in column_references;
+        // `now` follows `>` and is not a column position at all.
+        assert!(is_column_position(&tokens, idx("count"), src));
+        assert!(!is_column_position(&tokens, idx("now"), src));
+    }
+
+    #[test]
+    fn ident_chain_finds_dotted_paths() {
+        let src = "SELECT * FROM sales.events WHERE a.x > b.y;";
+        let (tokens, _) = lex(src);
+        let x_idx = tokens.iter().position(|t| t.text(src) == "x").unwrap();
+        let chain = ident_chain(&tokens, x_idx, src);
+        assert_eq!(chain.parts, vec!["a", "x"]);
+        assert_eq!(chain.idx_in_chain, 1);
+        let a_idx = tokens.iter().position(|t| t.text(src) == "a").unwrap();
+        let chain_a = ident_chain(&tokens, a_idx, src);
+        assert_eq!(chain_a.parts, vec!["a", "x"]);
+        assert_eq!(chain_a.idx_in_chain, 0);
     }
 }

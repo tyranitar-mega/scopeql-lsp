@@ -7,7 +7,7 @@
 //! scans the workspace root(s) for `.scopeql` files on demand and overlays
 //! the open documents on top.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
@@ -58,9 +58,23 @@ struct IndexFile {
     text: String,
 }
 
-/// One object-name occurrence in an indexed source.
+/// The kind of an indexed name occurrence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    /// A table / view / schema / ... name.
+    Object,
+    /// A column of a table.
+    Column,
+}
+
+/// One name occurrence in an indexed source.
 struct IndexEntry {
+    kind: EntryKind,
+    /// Object path (for [`EntryKind::Object`]) or column name (for
+    /// [`EntryKind::Column`]), lower-cased.
     name: String,
+    /// The owning table's lower-cased dotted path; `Some` for columns.
+    table: Option<String>,
     role: ObjectRole,
     span: scopeql_lsp::lexer::Span,
     /// Index into [`WorkspaceIndex::files`].
@@ -87,6 +101,62 @@ impl WorkspaceIndex {
                 &file.text,
             ),
         })
+    }
+
+    /// Locations of object entries whose name matches `path` (and role).
+    fn object_locations(&self, path: &str, role: Option<ObjectRole>) -> Vec<Location> {
+        self.entries
+            .iter()
+            .filter(|e| {
+                e.kind == EntryKind::Object
+                    && role.is_none_or(|r| e.role == r)
+                    && resolve::names_match(path, &e.name)
+            })
+            .filter_map(|e| self.location_of(e))
+            .collect()
+    }
+
+    /// Locations of column entries with column name `column` belonging to one
+    /// of `tables` (and role). `qualifier` is the dotted path left of the
+    /// dot (e.g. `logs` in `logs.time`): it is resolved against the visible
+    /// tables first, and falls back to itself when nothing matches.
+    fn column_locations(
+        &self,
+        visible: &[resolve::VisibleTable],
+        qualifier: Option<&str>,
+        column: &str,
+        role: Option<ObjectRole>,
+    ) -> Vec<Location> {
+        let tables: Vec<String> = match qualifier {
+            Some(q) => {
+                let matched: Vec<String> = visible
+                    .iter()
+                    .filter(|v| {
+                        v.alias.as_deref() == Some(q)
+                            || resolve::names_match(&v.path, q)
+                    })
+                    .map(|v| v.path.clone())
+                    .collect();
+                if matched.is_empty() {
+                    vec![q.to_string()]
+                } else {
+                    matched
+                }
+            }
+            None => visible.iter().map(|v| v.path.clone()).collect(),
+        };
+        self.entries
+            .iter()
+            .filter(|e| {
+                e.kind == EntryKind::Column
+                    && role.is_none_or(|r| e.role == r)
+                    && e.name == column
+                    && tables
+                        .iter()
+                        .any(|t| resolve::names_match(t, e.table.as_deref().unwrap_or("")))
+            })
+            .filter_map(|e| self.location_of(e))
+            .collect()
     }
 }
 
@@ -455,10 +525,42 @@ fn hover_text(kind: lexer::TokenKind, word: &str) -> String {
     }
 }
 
-/// The lower-cased, dot-joined object path under the cursor, if the cursor is
-/// on an identifier — e.g. `sales.orders` when the cursor is on `orders` in
-/// `FROM sales.orders`. Columns / keyword / literal positions return `None`.
-fn path_at(text: &str, position: Position) -> Option<String> {
+fn sort_locations(locations: &mut [Location]) {
+    locations.sort_by(|a, b| {
+        a.uri
+            .cmp(&b.uri)
+            .then_with(|| a.range.start.line.cmp(&b.range.start.line))
+            .then_with(|| a.range.start.character.cmp(&b.range.start.character))
+            .then_with(|| a.range.end.line.cmp(&b.range.end.line))
+            .then_with(|| a.range.end.character.cmp(&b.range.end.character))
+    });
+}
+
+/// Turn a list of locations into the `textDocument/definition` result.
+fn definition_value(mut locations: Vec<Location>) -> Option<GotoDefinitionResponse> {
+    sort_locations(&mut locations);
+    locations.dedup();
+    match locations.len() {
+        0 => None,
+        1 => Some(GotoDefinitionResponse::Scalar(locations.remove(0))),
+        _ => Some(GotoDefinitionResponse::Array(locations)),
+    }
+}
+
+/// What the cursor is pointing at.
+enum Target {
+    /// An object path (`logs`, `sales.orders`, ...).
+    Object(String),
+    /// A column reference: bare (`id`) or qualified (`logs.id`, `l.id`).
+    Column {
+        qualifier: Option<String>,
+        column: String,
+    },
+}
+
+/// Classify the identifier under the cursor into a navigation target. Also
+/// returns the byte offset of the cursor for statement-scope lookups.
+fn cursor_target(text: &str, position: Position) -> Option<(Target, usize)> {
     let (tokens, _) = lexer::lex(text);
     let line_index = LineIndex::new(text);
     let byte = byte_offset(&line_index, position, text)?;
@@ -469,102 +571,146 @@ fn path_at(text: &str, position: Position) -> Option<String> {
         return None;
     }
 
-    let is_dot = |t: &Token, source: &str| {
-        t.kind == TokenKind::Operator && &source[t.span.start as usize..t.span.end as usize] == "."
-    };
-
-    // Extend left over `ident . ident` so the cursor on `orders` in
-    // `sales.orders` still resolves the whole path.
-    let mut start = idx;
-    while start >= 2 && is_dot(&tokens[start - 1], text) && tokens[start - 2].kind == TokenKind::Ident
-    {
-        start -= 2;
-    }
-    let mut end = idx + 1;
-    while end + 1 < tokens.len() && is_dot(&tokens[end], text) && tokens[end + 1].kind == TokenKind::Ident
-    {
-        end += 2;
-    }
-
-    let mut parts = Vec::new();
-    for t in &tokens[start..end] {
-        if t.kind == TokenKind::Ident {
-            parts.push(text[t.span.start as usize..t.span.end as usize].to_ascii_lowercase());
+    let chain = resolve::ident_chain(&tokens, idx, text);
+    let target = if chain.parts.len() > 1 {
+        if chain.idx_in_chain < chain.parts.len() - 1 {
+            // Cursor on the qualifier of a dotted path: `sales` in
+            // `sales.orders` resolves as the object.
+            Target::Object(chain.parts[..=chain.idx_in_chain].join("."))
+        } else {
+            // Cursor on the last member: `orders` in `sales.orders`, or
+            // `id` in `l.id` — a column of the qualified table.
+            let column = chain.parts.last().expect("non-empty chain").clone();
+            let qualifier = chain.parts[..chain.parts.len() - 1].join(".");
+            Target::Column {
+                qualifier: Some(qualifier),
+                column,
+            }
         }
-    }
-    Some(parts.join("."))
+    } else if resolve::is_column_position(&tokens, idx, text) {
+        Target::Column {
+            qualifier: None,
+            column: chain.parts[0].clone(),
+        }
+    } else {
+        Target::Object(chain.parts[0].clone())
+    };
+    Some((target, byte))
 }
 
-/// `textDocument/definition`: jump from a table reference (or its own
-/// definition) to the matching `CREATE ...` sites.
+/// The tables in scope for the statement containing byte `byte`, folded into
+/// the shape [`WorkspaceIndex::column_locations`] expects. A qualified
+/// reference resolves the qualifier against the visible tables (by alias or
+/// path) and falls back to taking the qualifier as the table name. A bare
+/// reference uses every visible table; when none are visible (e.g. the
+/// cursor sits on a column definition inside `CREATE TABLE`), the column's
+/// own defining table is used.
+fn cursor_tables(
+    text: &str,
+    tokens: &[Token],
+    byte: usize,
+    qualifier: Option<&str>,
+    column: &str,
+) -> Vec<resolve::VisibleTable> {
+    let (from, to) = resolve::statement_range(tokens, byte, text);
+    let visible = resolve::visible_tables(tokens, from, to, text);
+    match qualifier {
+        Some(q) => {
+            let matched: Vec<String> = visible
+                .iter()
+                .filter(|v| v.alias.as_deref() == Some(q) || resolve::names_match(&v.path, q))
+                .map(|v| v.path.clone())
+                .collect();
+            if matched.is_empty() {
+                vec![resolve::VisibleTable {
+                    path: q.to_string(),
+                    alias: None,
+                }]
+            } else {
+                matched
+                    .into_iter()
+                    .map(|path| resolve::VisibleTable { path, alias: None })
+                    .collect()
+            }
+        }
+        None => {
+            let mut tables: Vec<String> = visible.iter().map(|v| v.path.clone()).collect();
+            if tables.is_empty() {
+                // Cursor on a column definition inside `CREATE TABLE`/
+                // `ALTER TABLE ... ADD COLUMN`: scope to its owning table.
+                for def in resolve::column_definitions(text) {
+                    if def.span.start as usize <= byte
+                        && byte < def.span.end as usize
+                        && def.column == column
+                    {
+                        tables.push(def.table);
+                    }
+                }
+            }
+            tables
+                .into_iter()
+                .map(|path| resolve::VisibleTable { path, alias: None })
+                .collect()
+        }
+    }
+}
+
+/// `textDocument/definition`: jump from a table or column reference (or its
+/// own definition) to the matching `CREATE ...` sites.
 fn definition_for(
     server: &mut Server,
     params: &GotoDefinitionParams,
 ) -> Result<Option<GotoDefinitionResponse>, Box<dyn std::error::Error>> {
     let uri = params.text_document_position_params.text_document.uri.clone();
     let position = params.text_document_position_params.position;
-    let Some(doc) = server.documents.get(&uri) else {
+    let Some(text) = server.documents.get(&uri).map(|d| d.text.clone()) else {
         return Ok(None);
     };
-    let Some(path) = path_at(&doc.text, position) else {
+    let Some((target, byte)) = cursor_target(&text, position) else {
         return Ok(None);
     };
 
     let extra_roots = request_roots(server, &uri);
     let index = server.build_index(&extra_roots);
-    let mut locations: Vec<Location> = index
-        .entries
-        .iter()
-        .filter(|e| e.role == ObjectRole::Definition && resolve::names_match(&path, &e.name))
-        .filter_map(|e| index.location_of(e))
-        .collect();
-    sort_locations(&mut locations);
-    locations.dedup();
-
-    Ok(match locations.len() {
-        0 => None,
-        1 => Some(GotoDefinitionResponse::Scalar(locations.remove(0))),
-        _ => Some(GotoDefinitionResponse::Array(locations)),
-    })
+    let locations = match &target {
+        Target::Object(path) => index.object_locations(path, Some(ObjectRole::Definition)),
+        Target::Column { qualifier, column } => {
+            let (tokens, _) = lexer::lex(&text);
+            let tables = cursor_tables(&text, &tokens, byte, qualifier.as_deref(), column);
+            index.column_locations(&tables, None, column, Some(ObjectRole::Definition))
+        }
+    };
+    Ok(definition_value(locations))
 }
 
-/// `textDocument/references`: every mention of the object under the cursor,
-/// including its definition(s) and all references across the workspace.
+/// `textDocument/references`: every mention of the object or column under
+/// the cursor, including its definition(s) and all references.
 fn references_for(
     server: &mut Server,
     params: &ReferenceParams,
 ) -> Result<Vec<Location>, Box<dyn std::error::Error>> {
     let uri = params.text_document_position.text_document.uri.clone();
     let position = params.text_document_position.position;
-    let Some(doc) = server.documents.get(&uri) else {
+    let Some(text) = server.documents.get(&uri).map(|d| d.text.clone()) else {
         return Ok(Vec::new());
     };
-    let Some(path) = path_at(&doc.text, position) else {
+    let Some((target, byte)) = cursor_target(&text, position) else {
         return Ok(Vec::new());
     };
 
     let extra_roots = request_roots(server, &uri);
     let index = server.build_index(&extra_roots);
-    let mut locations: Vec<Location> = index
-        .entries
-        .iter()
-        .filter(|e| resolve::names_match(&path, &e.name))
-        .filter_map(|e| index.location_of(e))
-        .collect();
+    let mut locations = match &target {
+        Target::Object(path) => index.object_locations(path, None),
+        Target::Column { qualifier, column } => {
+            let (tokens, _) = lexer::lex(&text);
+            let tables = cursor_tables(&text, &tokens, byte, qualifier.as_deref(), column);
+            index.column_locations(&tables, None, column, None)
+        }
+    };
     sort_locations(&mut locations);
     locations.dedup();
     Ok(locations)
-}
-
-fn sort_locations(locations: &mut [Location]) {
-    locations.sort_by(|a, b| {
-        a.uri
-            .cmp(&b.uri)
-            .then_with(|| a.range.start.line.cmp(&b.range.start.line))
-            .then_with(|| a.range.start.character.cmp(&b.range.start.character))
-            .then_with(|| a.range.end.line.cmp(&b.range.end.line))
-            .then_with(|| a.range.end.character.cmp(&b.range.end.character))
-    });
 }
 
 /// Workspace roots for a request: the client-reported roots, or — when the
@@ -611,13 +757,49 @@ impl Server {
             }
         }
 
+        // Phase A: object names and column definitions.
         let mut entries = Vec::new();
         for (file, source) in files.iter().enumerate() {
             for object in resolve::object_names(&source.text) {
                 entries.push(IndexEntry {
+                    kind: EntryKind::Object,
                     name: object.name,
+                    table: None,
                     role: object.role,
                     span: object.span,
+                    file,
+                });
+            }
+        }
+        // Column definitions are collected across the whole workspace first,
+        // so references can be verified against them.
+        let mut known_columns: HashMap<String, HashSet<String>> = HashMap::new();
+        for (file, source) in files.iter().enumerate() {
+            for column in resolve::column_definitions(&source.text) {
+                entries.push(IndexEntry {
+                    kind: EntryKind::Column,
+                    name: column.column.clone(),
+                    table: Some(column.table.clone()),
+                    role: ObjectRole::Definition,
+                    span: column.span,
+                    file,
+                });
+                known_columns
+                    .entry(resolve::ColumnDef::table_key(&column.table))
+                    .or_default()
+                    .insert(column.column);
+            }
+        }
+        // Phase B: column references, kept only when the target table
+        // declares the column.
+        for (file, source) in files.iter().enumerate() {
+            for column in resolve::column_references(&source.text, &known_columns) {
+                entries.push(IndexEntry {
+                    kind: EntryKind::Column,
+                    name: column.column,
+                    table: Some(column.table),
+                    role: ObjectRole::Reference,
+                    span: column.span,
                     file,
                 });
             }

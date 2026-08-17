@@ -23,6 +23,11 @@ in this repository on its own.
   lists every mention of it in the workspace, including its definition. Both
   work on qualified names (`FROM sales.orders` resolves `CREATE TABLE
   sales.orders ...`) and are case-insensitive.
+- **Column navigation** — `gd`/`gr` also work on columns: `SELECT service
+  FROM events` resolves `service` to its `CREATE TABLE` column; `c.id`
+  resolves through the alias to the joined table's column (cross-file, e.g.
+  into an index's `ON t (col)` target). Ambiguous unqualified columns in a
+  join return every candidate table.
 - **Diagnostics** (`textDocument/publishDiagnostics`) — lexical errors
   (unrecognized input) are pushed to the editor as errors.
 - **Hover** (`textDocument/hover`) — a short description for keywords, types
@@ -117,14 +122,23 @@ statements (`CREATE POINT INDEX ON t (...)`, `CREATE SEARCH INDEX`,
 
 ### Known limitations
 
-- Only *object* names are resolved (tables, views, schemas, databases,
-  indexes, jobs, nodegroups). Columns and aliases are not — `gd`/`gr` on a
-  column returns nothing.
-- Names must be written as unquoted identifiers; backticked identifiers are
-  not indexed yet.
+- Column resolution is scoped per statement via `FROM`/`JOIN`/... targets and
+  their aliases. CTEs (`WITH cte AS (...)`) are not tracked, and a subquery's
+  visible tables leak into the enclosing statement, so unusual nested queries
+  may resolve to extra candidates.
 - In a multi-table `FROM a, b` list only the name following `FROM` (and each
   `JOIN`) is collected; later comma-separated tables in the same `FROM` are
   not.
+- Names must be written as unquoted identifiers; backticked identifiers are
+  not indexed yet.
+- A column reference is indexed only when the column is declared somewhere in
+  the workspace, so a column used before its table is defined yields no
+  references.
+- Semi-structured bracket paths (`var['host']`) resolve the base column
+  (`var`) but not the member inside the brackets.
+
+The navigation design is documented in
+[docs/design.md](docs/design.md).
 
 ### vim + coc.nvim (recommended)
 
@@ -190,7 +204,7 @@ scopeql-lsp/
 ├── src/
 │   ├── lexer.rs              vendored ScopeQL lexer (logos)
 │   ├── highlight.rs          token → semantic token classification + legend
-│   ├── resolve.rs            object-name extraction + matching (gd / gr)
+│   ├── resolve.rs            object/column extraction + matching (gd / gr)
 │   ├── doc.rs                byte-offset ↔ LSP position mapping
 │   ├── main.rs               LSP message loop, workspace index, request handlers
 │   └── lib.rs                library facade
@@ -198,6 +212,7 @@ scopeql-lsp/
 ├── ftdetect/                 .scopeql filetype detection
 ├── ftplugin/                 scopeql editing options
 ├── syntax/                   fallback lexical syntax highlighting
+├── docs/design.md            navigation design notes
 └── scripts/smoke_test.py     stdio LSP smoke test (tokens, hover, gd, gr)
 ```
 
