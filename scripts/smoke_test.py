@@ -223,6 +223,20 @@ assert len(cust_edits) == 1, changes
 assert cust_edits[0]["newText"] == "customer_id", changes
 assert cust_edits[0]["range"]["start"] == {"line": 0, "character": 24}, changes
 
+# --- regression: gd on an object in a column-shaped position -------------
+# `events` after ON in an index statement must resolve as an object, not as
+# a column (ON is a column-position keyword in the heuristic).
+idx_uri = (ws / "indexes.scopeql").as_uri()
+(ws / "indexes.scopeql").write_text("CREATE POINT INDEX ON events (id);\n")
+send(proc, {"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {
+    "textDocument": {"uri": idx_uri, "languageId": "scopeql", "version": 1,
+                     "text": "CREATE POINT INDEX ON events (id);\n"}}})
+loc = one_loc(21, "textDocument/definition", idx_uri,
+              {"line": 0, "character": 22 + 3})
+print("\n== gd on `events` after ON (index stmt) ==", json.dumps(loc))
+assert loc["uri"] == events_uri
+assert loc["range"]["start"] == {"line": 1, "character": 13}
+
 send(proc, {"jsonrpc": "2.0", "id": 99, "method": "shutdown", "params": None})
 resp = recv(proc)
 assert resp and resp["id"] == 99, resp

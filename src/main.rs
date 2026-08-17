@@ -585,6 +585,17 @@ fn cursor_target(text: &str, position: Position) -> Option<(Target, usize)> {
         return None;
     }
 
+    // A cursor on an object occurrence wins over the column heuristics:
+    // `logs` in `ON logs` (index statement) or inside a qualified path like
+    // `sales.orders` in FROM is an *object*, even though the position looks
+    // column-shaped (`on` is a column-position keyword).
+    if let Some(object) = resolve::object_names(text)
+        .into_iter()
+        .find(|o| o.span.start as usize <= byte && byte < o.span.end as usize)
+    {
+        return Some((Target::Object(object.name), byte));
+    }
+
     let chain = resolve::ident_chain(&tokens, idx, text);
     let target = if chain.parts.len() > 1 {
         if chain.idx_in_chain < chain.parts.len() - 1 {
