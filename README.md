@@ -28,6 +28,11 @@ in this repository on its own.
   resolves through the alias to the joined table's column (cross-file, e.g.
   into an index's `ON t (col)` target). Ambiguous unqualified columns in a
   join return every candidate table.
+- **Rename** (`textDocument/rename`) — rename the table or column under the
+  cursor across the whole workspace (`:CocAction('rename')`). Qualified
+  names keep their schema prefix (`sales.orders` → `sales.orders_new`), and
+  renaming a column updates every reference, through aliases and across
+  files.
 - **Diagnostics** (`textDocument/publishDiagnostics`) — lexical errors
   (unrecognized input) are pushed to the editor as errors.
 - **Hover** (`textDocument/hover`) — a short description for keywords, types
@@ -100,6 +105,7 @@ Any LSP client can connect to `scopeql-lsp` over stdio. It advertises:
 | `hoverProvider` | true |
 | `definitionProvider` | true (workspace-wide) |
 | `referencesProvider` | true (workspace-wide) |
+| `renameProvider` | true (workspace-wide) |
 | diagnostics | push via `publishDiagnostics` |
 
 ### Navigating objects

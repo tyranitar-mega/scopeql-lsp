@@ -198,6 +198,31 @@ assert resp and resp["id"] == 18, resp
 print("== definition on count() == null:", resp["result"] is None)
 assert resp["result"] is None, resp
 
+# --- rename -------------------------------------------------------------
+def rename(rid, uri, position, new_name):
+    send(proc, {"jsonrpc": "2.0", "id": rid, "method": "textDocument/rename",
+                "params": {"textDocument": {"uri": uri}, "position": position,
+                           "newName": new_name}})
+    resp = recv(proc)
+    assert resp and resp["id"] == rid, resp
+    return resp["result"]
+
+edit = rename(19, events_uri, events_ref_pos, "event_log")
+changes = edit["changes"] if edit else {}
+print("\n== rename events -> event_log (from FROM) ==", json.dumps(edit))
+ev_edits = changes.get(events_uri, [])
+assert len(ev_edits) == 2, changes           # definition + FROM reference
+assert all(e["newText"] == "event_log" for e in ev_edits), changes
+assert customers_uri not in changes, changes
+
+edit = rename(20, events_uri, c_id_pos, "customer_id")
+changes = edit["changes"] if edit else {}
+print("== rename customers.id -> customer_id (alias, cross-file) ==", json.dumps(edit))
+cust_edits = changes.get(customers_uri, [])
+assert len(cust_edits) == 1, changes
+assert cust_edits[0]["newText"] == "customer_id", changes
+assert cust_edits[0]["range"]["start"] == {"line": 0, "character": 24}, changes
+
 send(proc, {"jsonrpc": "2.0", "id": 99, "method": "shutdown", "params": None})
 resp = recv(proc)
 assert resp and resp["id"] == 99, resp

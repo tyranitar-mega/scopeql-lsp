@@ -15,16 +15,16 @@ use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as LspNotification,
 };
 use lsp_types::request::{
-    GotoDefinition, HoverRequest, References, Request as _, SemanticTokensFullRequest,
+    GotoDefinition, HoverRequest, References, Rename, Request as _, SemanticTokensFullRequest,
 };
 use lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DiagnosticSeverity, Diagnostic as LspDiagnostic, GotoDefinitionParams, GotoDefinitionResponse,
     Hover, HoverContents, InitializeParams, Location, MarkupContent, MarkupKind, OneOf, Position,
-    PublishDiagnosticsParams, ReferenceParams, SemanticToken, SemanticTokens,
+    PublishDiagnosticsParams, ReferenceParams, RenameParams, SemanticToken, SemanticTokens,
     SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensResult,
     SemanticTokensServerCapabilities, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, Uri,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Uri, WorkspaceEdit,
 };
 use scopeql_lsp::doc::{LineIndex, utf16_len};
 use scopeql_lsp::highlight::{LEGEND_MODIFIERS, LEGEND_TYPES, semantic_tokens};
@@ -76,7 +76,13 @@ struct IndexEntry {
     /// The owning table's lower-cased dotted path; `Some` for columns.
     table: Option<String>,
     role: ObjectRole,
+    /// Byte range of the whole occurrence (the full dotted path for
+    /// objects).
     span: scopeql_lsp::lexer::Span,
+    /// Byte range of the identifier a rename replaces — the last component
+    /// of an object path (`orders` in `sales.orders`), the column name for
+    /// columns.
+    last_span: scopeql_lsp::lexer::Span,
     /// Index into [`WorkspaceIndex::files`].
     file: usize,
 }
@@ -324,6 +330,7 @@ fn server_capabilities() -> ServerCapabilities {
         hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Left(true)),
         ..Default::default()
     }
 }
@@ -362,6 +369,13 @@ fn handle_request(server: &mut Server, req: Request) -> Response {
         References::METHOD => {
             let (id, params) = extract::<ReferenceParams>(req, References::METHOD);
             match references_for(server, &params) {
+                Ok(result) => Response::new_ok(id, result),
+                Err(e) => internal_error(id, e),
+            }
+        }
+        Rename::METHOD => {
+            let (id, params) = extract::<RenameParams>(req, Rename::METHOD);
+            match rename_for(server, &params) {
                 Ok(result) => Response::new_ok(id, result),
                 Err(e) => internal_error(id, e),
             }
@@ -713,9 +727,92 @@ fn references_for(
     Ok(locations)
 }
 
-/// Workspace roots for a request: the client-reported roots, or — when the
-/// client sent none — the directory of the document being queried so that
-/// navigation still works out of the box.
+/// `textDocument/rename`: replace every occurrence of the object or column
+/// under the cursor with `new_name`, across the workspace. For qualified
+/// object paths only the final identifier is replaced (`sales.orders` ->
+/// `sales.new_name`), so schema qualifiers are preserved.
+#[allow(clippy::mutable_key_type)] // WorkspaceEdit requires Uri keys; Uri hashes by its (immutable) string.
+fn rename_for(
+    server: &mut Server,
+    params: &RenameParams,
+) -> Result<Option<WorkspaceEdit>, Box<dyn std::error::Error>> {
+    let uri = params.text_document_position.text_document.uri.clone();
+    let position = params.text_document_position.position;
+    let Some(text) = server.documents.get(&uri).map(|d| d.text.clone()) else {
+        return Ok(None);
+    };
+    let Some((target, byte)) = cursor_target(&text, position) else {
+        return Ok(None);
+    };
+
+    let extra_roots = request_roots(server, &uri);
+    let index = server.build_index(&extra_roots);
+    let new_name = params.new_name.clone();
+    let matches: Vec<&IndexEntry> = match &target {
+        Target::Object(path) => index
+            .entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::Object && resolve::names_match(path, &e.name))
+            .collect(),
+        Target::Column { qualifier, column } => {
+            let (tokens, _) = lexer::lex(&text);
+            let tables = cursor_tables(&text, &tokens, byte, qualifier.as_deref(), column);
+            index
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.kind == EntryKind::Column
+                        && e.name == *column
+                        && tables
+                            .iter()
+                            .any(|t| resolve::names_match(&t.path, e.table.as_deref().unwrap_or("")))
+                })
+                .collect()
+        }
+    };
+    if matches.is_empty() {
+        return Ok(None);
+    }
+
+    let mut changes: HashMap<String, Vec<TextEdit>> = HashMap::new();
+    let mut seen: HashSet<(String, Position, Position)> = HashSet::new();
+    for entry in matches {
+        let file = &index.files[entry.file];
+        let line_index = LineIndex::new(&file.text);
+        let range = line_index.to_range(
+            entry.last_span.start as usize,
+            entry.last_span.end as usize,
+            &file.text,
+        );
+        if seen.insert((file.uri.to_string(), range.start, range.end)) {
+            changes
+                .entry(file.uri.to_string())
+                .or_default()
+                .push(TextEdit {
+                    range,
+                    new_text: new_name.clone(),
+                });
+        }
+    }
+    for edits in changes.values_mut() {
+        edits.sort_by(|a, b| {
+            a.range
+                .start
+                .line
+                .cmp(&b.range.start.line)
+                .then_with(|| a.range.start.character.cmp(&b.range.start.character))
+        });
+    }
+    let changes = changes
+        .into_iter()
+        .filter_map(|(uri, edits)| std::str::FromStr::from_str(&uri).ok().map(|u| (u, edits)))
+        .collect();
+
+    Ok(Some(WorkspaceEdit {
+        changes: Some(changes),
+        ..Default::default()
+    }))
+}
 fn request_roots(server: &Server, uri: &Uri) -> Vec<PathBuf> {
     if !server.workspace_roots.is_empty() {
         return server.workspace_roots.clone();
@@ -767,6 +864,7 @@ impl Server {
                     table: None,
                     role: object.role,
                     span: object.span,
+                    last_span: object.last_span,
                     file,
                 });
             }
@@ -782,6 +880,7 @@ impl Server {
                     table: Some(column.table.clone()),
                     role: ObjectRole::Definition,
                     span: column.span,
+                    last_span: column.span,
                     file,
                 });
                 known_columns
@@ -800,6 +899,7 @@ impl Server {
                     table: Some(column.table),
                     role: ObjectRole::Reference,
                     span: column.span,
+                    last_span: column.span,
                     file,
                 });
             }

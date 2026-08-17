@@ -54,8 +54,11 @@ pub struct ObjectName {
     pub name: String,
     pub kind: ObjectKind,
     pub role: ObjectRole,
-    /// Byte range of the name path in the source.
+    /// Byte range of the whole name path in the source.
     pub span: Span,
+    /// Byte range of the *final* identifier of the path — the part a rename
+    /// of this object replaces (`order_events` in `sales.order_events`).
+    pub last_span: Span,
 }
 
 /// Object-category keywords. `PARTITION`/`CLUSTER`/`COLUMN`/`KEY` are left
@@ -151,6 +154,7 @@ pub fn object_names(source: &str) -> Vec<ObjectName> {
                                             ObjectRole::Definition
                                         },
                                         span,
+                                        last_span: last_identifier_span(&tokens, after),
                                     });
                                     i = after;
                                     continue;
@@ -165,6 +169,7 @@ pub fn object_names(source: &str) -> Vec<ObjectName> {
                                         kind,
                                         role: ObjectRole::Definition,
                                         span,
+                                        last_span: last_identifier_span(&tokens, after),
                                     });
                                     i = after;
                                     continue;
@@ -181,6 +186,7 @@ pub fn object_names(source: &str) -> Vec<ObjectName> {
                             kind,
                             role: ObjectRole::Reference,
                             span,
+                            last_span: last_identifier_span(&tokens, after),
                         });
                         i = after;
                         continue;
@@ -201,6 +207,7 @@ pub fn object_names(source: &str) -> Vec<ObjectName> {
                             kind,
                             role: ObjectRole::Reference,
                             span,
+                            last_span: last_identifier_span(&tokens, after),
                         });
                         i = after;
                         continue;
@@ -214,6 +221,7 @@ pub fn object_names(source: &str) -> Vec<ObjectName> {
                             kind,
                             role: ObjectRole::Reference,
                             span,
+                            last_span: last_identifier_span(&tokens, after),
                         });
                         i = after;
                         continue;
@@ -256,6 +264,13 @@ fn read_object_name(
     }
     let (name, span, after) = read_name_path(tokens, j, source)?;
     Some((name, kind, span, after))
+}
+
+/// The byte span of the final identifier of a name path, used as the rename
+/// target (`order_events` in `sales.order_events`). `after` is the exclusive
+/// token index past the last identifier.
+fn last_identifier_span(tokens: &[Token], after: usize) -> Span {
+    tokens[after.saturating_sub(1)].span
 }
 
 /// Read a dot-joined path of identifiers: `a`, `a.b`, `a.b.c`.

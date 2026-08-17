@@ -123,6 +123,21 @@ and by `names_match` on the table paths.
 definitions match; unknown targets return `null`. `gr` returns the sorted,
 de-duplicated list of definitions and references.
 
+## 5a. Rename
+
+`textDocument/rename` reuses the same matching as references. For every
+entry whose name matches the cursor target (objects by `names_match` on the
+path; columns by name plus owning table), a `TextEdit` is emitted for the
+entry's **`last_span`** — the final identifier of an object path, or the
+column name. Replacing the final identifier instead of the whole path keeps
+schema qualifiers intact: renaming `sales.orders` produces `sales.new_name`.
+Edits are grouped by URI into a `WorkspaceEdit`, sorted by position within
+each file, and de-duplicated. Because matching is workspace-wide and
+alias-aware, renaming a table or column updates its definition, every
+reference (including those written through aliases such as `c.id`) and every
+index `ON t (col)` target — across all `.scopeql` files under the workspace
+root.
+
 ## 6. Known limitations
 
 * Only the *first* table of a comma-separated `FROM a, b` list is visible;
