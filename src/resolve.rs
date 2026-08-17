@@ -61,6 +61,11 @@ const OBJECT_KINDS: &[(&str, ObjectKind)] = &[
     ("nodegroup", ObjectKind::Nodegroup),
 ];
 
+/// Index-kind qualifiers that can sit between `CREATE` and the object-kind
+/// keyword: `CREATE POINT INDEX`, `CREATE RANGE INDEX`, `CREATE SEARCH
+/// INDEX`, `CREATE MATERIALIZED INDEX`, `CREATE MATERIALIZED VIEW`.
+const KIND_QUALIFIERS: &[&str] = &["point", "range", "search", "materialized"];
+
 fn kind_of(word: &str) -> Option<ObjectKind> {
     OBJECT_KINDS
         .iter()
@@ -89,28 +94,73 @@ pub fn object_names(source: &str) -> Vec<ObjectName> {
         if tokens[i].kind == TokenKind::Keyword {
             let word = word_at(&tokens[i], source);
             match word.as_str() {
-                // `CREATE [OR REPLACE] <kind> [IF NOT EXISTS] name`.
+                // `CREATE [OR REPLACE] [POINT|RANGE|SEARCH|MATERIALIZED]
+                // <kind> [IF NOT EXISTS] name`, where ScopeQL indexes are
+                // anonymous: `CREATE ... INDEX ON table (...)` references the
+                // table named after `ON` instead of defining an index name.
                 "create" => {
                     let mut j = i + 1;
                     while j < tokens.len()
                         && tokens[j].kind == TokenKind::Keyword
-                        && matches!(word_at(&tokens[j], source).as_str(), "or" | "replace")
+                        && {
+                            let w = word_at(&tokens[j], source);
+                            matches!(w.as_str(), "or" | "replace")
+                                || KIND_QUALIFIERS.contains(&w.as_str())
+                        }
                     {
                         j += 1;
                     }
                     if j < tokens.len()
                         && tokens[j].kind == TokenKind::Keyword
                         && let Some(kind) = kind_of(&word_at(&tokens[j], source))
-                        && let Some((name, _, span, after)) = read_object_name(&tokens, j, source)
                     {
-                        out.push(ObjectName {
-                            name,
-                            kind,
-                            role: ObjectRole::Definition,
-                            span,
-                        });
-                        i = after;
-                        continue;
+                        match kind {
+                            ObjectKind::Index => {
+                                // `CREATE ... INDEX ON table` has no index
+                                // name; `ON <table>` is a table reference.
+                                let mut k = j + 1;
+                                let on_table = k < tokens.len()
+                                    && tokens[k].kind == TokenKind::Keyword
+                                    && word_at(&tokens[k], source) == "on";
+                                if on_table {
+                                    k += 1;
+                                }
+                                if let Some((name, _, span, after)) =
+                                    read_object_name(&tokens, k, source)
+                                {
+                                    out.push(ObjectName {
+                                        name,
+                                        kind: if on_table {
+                                            ObjectKind::Other
+                                        } else {
+                                            ObjectKind::Index
+                                        },
+                                        role: if on_table {
+                                            ObjectRole::Reference
+                                        } else {
+                                            ObjectRole::Definition
+                                        },
+                                        span,
+                                    });
+                                    i = after;
+                                    continue;
+                                }
+                            }
+                            _ => {
+                                if let Some((name, _, span, after)) =
+                                    read_object_name(&tokens, j, source)
+                                {
+                                    out.push(ObjectName {
+                                        name,
+                                        kind,
+                                        role: ObjectRole::Definition,
+                                        span,
+                                    });
+                                    i = after;
+                                    continue;
+                                }
+                            }
+                        }
                     }
                 }
                 // `DROP [kind] [IF EXISTS] name`, `ALTER [kind] name`.
@@ -333,6 +383,57 @@ mod tests {
         // BY a` / `CLUSTER BY b` and `WINDOW w` positions must not produce
         // spurious object names.
         assert_eq!(named, vec!["cte", "t", "t"]);
+    }
+
+    #[test]
+    fn index_statements_reference_the_target_table() {
+        // ScopeQL indexes are anonymous: `CREATE <TYPE> INDEX ON table (...)`
+        // references the table after `ON`; it does not define an index name.
+        let src = "CREATE TABLE logs (id int);\n\
+                   CREATE POINT INDEX ON logs (id);\n\
+                   CREATE RANGE INDEX ON logs (time);\n\
+                   CREATE SEARCH INDEX ON logs (message) WITH ('analyzer' = 'log');\n\
+                   CREATE MATERIALIZED INDEX ON logs (var['host']::string);";
+        let out = names(src);
+        let uses: Vec<(String, ObjectRole)> = out
+            .into_iter()
+            .filter(|(n, _)| n == "logs")
+            .collect();
+        let definitions = uses
+            .iter()
+            .filter(|(_, r)| *r == ObjectRole::Definition)
+            .count();
+        let references = uses
+            .iter()
+            .filter(|(_, r)| *r == ObjectRole::Reference)
+            .count();
+        assert_eq!((definitions, references), (1, 4), "{uses:?}");
+        // A plain `CREATE INDEX` without `ON` still registers the name.
+        assert_eq!(
+            names("CREATE INDEX idx ON logs (id);"),
+            vec![("idx".to_string(), ObjectRole::Definition)]
+        );
+    }
+
+    #[test]
+    fn materialized_view_is_a_definition() {
+        assert_eq!(
+            names("CREATE MATERIALIZED VIEW v AS SELECT 1;"),
+            vec![("v".to_string(), ObjectRole::Definition)]
+        );
+    }
+
+    #[test]
+    fn join_on_columns_are_not_tables() {
+        // `ON` must only trigger inside index statements; `a.id`/`b.id` in a
+        // join condition are column references and must not be collected.
+        let out = names("SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON c.x = b.x;");
+        let refs: Vec<&str> = out
+            .iter()
+            .filter(|(_, r)| *r == ObjectRole::Reference)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(refs, vec!["a", "b", "c"]);
     }
 
     #[test]

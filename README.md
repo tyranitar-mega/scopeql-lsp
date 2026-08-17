@@ -108,7 +108,10 @@ The index is built from every `.scopeql` file under the workspace root(s)
 reported by the client (or the current file's directory when none are
 reported), so navigation works across files. Unqualified and qualified
 spellings are matched case-insensitively and by dot-component suffix:
-`FROM t` finds `CREATE TABLE sales.t`, and vice versa.
+`FROM t` finds `CREATE TABLE sales.t`, and vice versa. Anonymous index
+statements (`CREATE POINT INDEX ON t (...)`, `CREATE SEARCH INDEX`,
+`CREATE MATERIALIZED INDEX`, ...) count as references to the target table
+`t`, so `gr` on the table shows every index built on it.
 
 ### Known limitations
 
