@@ -14,12 +14,22 @@ in this repository on its own.
   colors keywords, type names, object names, columns, functions, strings,
   numbers, operators and comments from a stable LSP legend. Object-defining
   keywords (`CREATE`, `DROP`, `ALTER`, ...) carry the `declaration` modifier.
+- **Go to definition** (`textDocument/definition`) — `gd` on a table (or
+  view / schema / database / index / job) name jumps to its `CREATE ...`
+  site, even across files.
+- **Find references** (`textDocument/references`) — `gr` on an object name
+  lists every mention of it in the workspace, including its definition. Both
+  work on qualified names (`FROM sales.orders` resolves `CREATE TABLE
+  sales.orders ...`) and are case-insensitive.
 - **Diagnostics** (`textDocument/publishDiagnostics`) — lexical errors
   (unrecognized input) are pushed to the editor as errors.
 - **Hover** (`textDocument/hover`) — a short description for keywords, types
   and literals.
-- **Full document sync** — the server re-lexes on every keystroke; there is
-  no project state, so it is fast and stateless.
+- **Full document sync** — the server re-lexes on every keystroke; semantic
+  highlighting is stateless and fast. Navigation builds a small workspace
+  index on demand by scanning the workspace root(s) for `.scopeql` files and
+  overlaying the open documents, so it always reflects the files currently
+  on disk.
 
 Semantic classification is lexical: identifiers right before `(` read as
 function calls, names after `CREATE TABLE`/`FROM`/`JOIN`/`INTO`/... read as
@@ -81,7 +91,35 @@ Any LSP client can connect to `scopeql-lsp` over stdio. It advertises:
 | `textDocumentSync` | full |
 | `semanticTokensProvider` | full document |
 | `hoverProvider` | true |
+| `definitionProvider` | true (workspace-wide) |
+| `referencesProvider` | true (workspace-wide) |
 | diagnostics | push via `publishDiagnostics` |
+
+### Navigating objects
+
+Point the cursor at an object name — after `FROM`/`JOIN`/`INSERT INTO`/
+`UPDATE`/`DELETE FROM`/`DROP`/`ALTER`/`DESCRIBE`/..., or on its own
+`CREATE` site — and:
+
+- `gd` jumps to the definition (`:CocAction('jumpDefinition')`).
+- `gr` lists all references (`:CocAction('jumpReferences')`).
+
+The index is built from every `.scopeql` file under the workspace root(s)
+reported by the client (or the current file's directory when none are
+reported), so navigation works across files. Unqualified and qualified
+spellings are matched case-insensitively and by dot-component suffix:
+`FROM t` finds `CREATE TABLE sales.t`, and vice versa.
+
+### Known limitations
+
+- Only *object* names are resolved (tables, views, schemas, databases,
+  indexes, jobs, nodegroups). Columns and aliases are not — `gd`/`gr` on a
+  column returns nothing.
+- Names must be written as unquoted identifiers; backticked identifiers are
+  not indexed yet.
+- In a multi-table `FROM a, b` list only the name following `FROM` (and each
+  `JOIN`) is collected; later comma-separated tables in the same `FROM` are
+  not.
 
 ### vim + coc.nvim (recommended)
 
@@ -147,14 +185,15 @@ scopeql-lsp/
 ├── src/
 │   ├── lexer.rs              vendored ScopeQL lexer (logos)
 │   ├── highlight.rs          token → semantic token classification + legend
+│   ├── resolve.rs            object-name extraction + matching (gd / gr)
 │   ├── doc.rs                byte-offset ↔ LSP position mapping
-│   ├── main.rs               LSP message loop and request handlers
+│   ├── main.rs               LSP message loop, workspace index, request handlers
 │   └── lib.rs                library facade
 ├── plugin/                   vim plugin: coc semantic-token highlight links
 ├── ftdetect/                 .scopeql filetype detection
 ├── ftplugin/                 scopeql editing options
 ├── syntax/                   fallback lexical syntax highlighting
-└── scripts/smoke_test.py     stdio LSP smoke test
+└── scripts/smoke_test.py     stdio LSP smoke test (tokens, hover, gd, gr)
 ```
 
 ## License
